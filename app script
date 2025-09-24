@@ -5,7 +5,7 @@ var EMAIL_ROW = 3;                    // emails (can be hidden)
 var DATA_START_ROW = 4;               // first row with assignments
 
 // SHARED / TEST CALENDAR ID
-var SHARED_CALENDAR_ID = 'c_9k16qh47qp3f03j6m81fj5tgek@group.calendar.google.com';
+var SHARED_CALENDAR_ID = 'INPUT CALENDAR ID';
 
 // Calendar wins for title/date when an event already exists (reflect manual calendar edits)
 var CALENDAR_WINS_TITLE_DATE = true;
