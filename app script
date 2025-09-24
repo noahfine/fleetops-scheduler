@@ -1281,13 +1281,15 @@ function pruneDeletedEventRefsForRow_(row, cal, emailsMap, skipColsSet){
     }
 
     var isEditedCol = !!(skipColsSet && skipColsSet[c]);
+    var isOnEditPass = !!skipColsSet; // any presence indicates we're in an onEdit/queued edit context
 
     if (!ev || !stillGuest) {
-      if (isEditedCol) {
-        // User just pasted/typed here: drop the stale note but PRESERVE the value
+      if (isOnEditPass) {
+        // During an edit pass, never clear values in any column. Only drop stale notes.
+        // This prevents fast delete-then-paste moves from being reverted.
         cell.setNote('');
       } else {
-        // Clear value+note only when not part of the current edit pass
+        // Outside edit context (manual/windowed operations), it's safe to clear both.
         cell.setValue('');
         cell.setNote('');
       }
