@@ -1490,11 +1490,26 @@ function getAllDayEventsOn_(cal, dayStart){
   return out;
 }
 function removeGuestAndDeleteIfEmpty_(ev, email){
-  try { ev.removeGuest(email); } catch(_){ }
-  var remaining = ev.getGuestList() || [];
-  if (remaining.length === 0){
-    try { ev.deleteEvent(); return true; } catch(_) {}
-  }
+  // Normalize email and remove robustly even if case/alias differs
+  var targetLower = String(email || '').trim().toLowerCase();
+  if (!targetLower) return false;
+  try { ev.removeGuest(targetLower); } catch(_){ }
+  try {
+    var guests = ev.getGuestList() || [];
+    for (var i=0; i<guests.length; i++){
+      var ge = guests[i].getEmail() || '';
+      if (String(ge).toLowerCase() === targetLower){
+        try { ev.removeGuest(ge); } catch(_){ }
+      }
+    }
+  } catch(_){ }
+  // Delete event if no guests remain
+  try {
+    var remaining = ev.getGuestList() || [];
+    if (remaining.length === 0){
+      try { ev.deleteEvent(); return true; } catch(_) { return false; }
+    }
+  } catch(_){ }
   return false;
 }
 function findEventOnDayByTitle_(cal, dayStart, titleKey){
