@@ -93,18 +93,77 @@ function onEditHandler(e){
     sh = e.range.getSheet();
     if (sh.getName() !== SHEET_NAME) return;
 
-    SpreadsheetApp.flush();
-
+    // Determine bounds without flushing for a fast single-cell path
     r1 = e.range.getRow();
     r2 = e.range.getLastRow ? e.range.getLastRow() : r1;
     c1 = e.range.getColumn();
     c2 = e.range.getLastColumn ? e.range.getLastColumn() : c1;
 
-    if(!lock.tryLock(2000)) {
+    // Short lock wait; if busy, queue a near-term retry
+    if(!lock.tryLock(300)) {
       queueRowsForSync_(sh.getName(), r1, r2);
-      scheduleOneOff_('processPendingEdits_', 1);
+      scheduleOneOff_('processPendingEdits_', 0.05); // ~3 seconds
       return;
     }
+
+    // Fast path for single-cell edits inside the data grid
+    var isSingleCell = (r1 === r2) && (c1 === c2) && r1 >= DATA_START_ROW && c1 >= 2;
+    if (isSingleCell) {
+      // Try fast single-cell processing; on failure, queue row and exit
+      try {
+        var cal = CalendarApp.getCalendarById(SHARED_CALENDAR_ID);
+        if (cal) {
+          var cell = sh.getRange(r1, c1);
+          var dateVal = asDate_(sh.getRange(r1,1).getValue());
+          var email = String(getEmailForCol_(sh, c1) || '').trim().toLowerCase();
+          if (dateVal && email) {
+            var dayStart = new Date(dateVal.getFullYear(), dateVal.getMonth(), dateVal.getDate());
+            var rawValue = (e && Object.prototype.hasOwnProperty.call(e, 'value')) ? String(e.value || '').trim() : String(cell.getValue() || '').trim();
+            var note = String(cell.getNote() || '').trim();
+            var eventId = parseEventIdFromNote_(note);
+            var existingEvent = eventId ? getEventByIdSafe_(cal, eventId) : null;
+
+            if (!rawValue || equalsIgnoreCase_(rawValue, CANCEL_TOKEN)) {
+              if (existingEvent) {
+                try {
+                  var st = existingEvent.getStartTime();
+                  var dk = dateKey_(new Date(st.getFullYear(), st.getMonth(), st.getDate()));
+                  var tNow = collapseWhitespace_(existingEvent.getTitle() || '');
+                  addSuppression_(dk, normalizeKey_(tNow), email, RECREATE_SUPPRESS_HOURS);
+                } catch(_) {}
+                removeGuestAndDeleteIfEmpty_(existingEvent, email);
+              }
+              if (note) cell.setNote('');
+              return;
+            }
+
+            var title = collapseWhitespace_(rawValue);
+            var tKey = normalizeKey_(title);
+            if (tKey) {
+              var targetEvent = existingEvent || findEventOnDayByTitle_(cal, dayStart, tKey);
+              if (!targetEvent) {
+                targetEvent = cal.createAllDayEvent(title, dayStart, { description: '', guests: '', sendInvites: SEND_INVITES });
+              }
+              upsertDescriptionKeepUserContent_(targetEvent, title);
+              if (!hasGuest_(targetEvent, email)) { try { targetEvent.addGuest(email); } catch(_) {} }
+              var titleFromCal = CALENDAR_WINS_TITLE_DATE ? collapseWhitespace_(targetEvent.getTitle() || '') : title;
+              if (!CALENDAR_WINS_TITLE_DATE && titleFromCal !== title) { try { targetEvent.setTitle(title); titleFromCal = title; } catch(_) {} }
+              if (String(cell.getValue() || '').trim() !== titleFromCal) { cell.setValue(titleFromCal); }
+              cell.setNote(JSON.stringify({ eventId: canonicalId_(targetEvent.getId()), titleKey: normalizeKey_(titleFromCal), syncedAt: new Date().toISOString() }));
+              return;
+            }
+          }
+        }
+      } catch(errFast) {
+        // Fall through to queue
+      }
+      queueRowsForSync_(sh.getName(), r1, r1);
+      scheduleOneOff_('processPendingEdits_', 0.05);
+      return;
+    }
+
+    // Fallback for multi-cell/paste edits
+    SpreadsheetApp.flush();
 
     var skipColsSet = {};
     for (var c = c1; c <= c2; c++) skipColsSet[c] = true;
@@ -120,16 +179,16 @@ function onEditHandler(e){
       }catch(err){ errors++; queueRowsForSync_(sh.getName(), r, r); }
     }
 
-    if (errors) scheduleOneOff_('processPendingEdits_', 1);
+    if (errors) scheduleOneOff_('processPendingEdits_', 0.05);
 
     toast_('Edit sync: rows ' + start + '–' + r2 +
            '  C:' + created + ' U:' + updated + ' D:' + deleted +
            ' +G:' + mAdd + ' -G:' + mRem + (errors ? ' Errors:' + errors : ''));
   }catch(err){
-    if (sh && r1 && r2) { queueRowsForSync_(sh.getName(), r1, r2); scheduleOneOff_('processPendingEdits_', 1); }
+    if (sh && r1 && r2) { queueRowsForSync_(sh.getName(), r1, r2); scheduleOneOff_('processPendingEdits_', 0.05); }
     toast_('onEditHandler error (queued for retry): ' + err);
   }finally{
-    try{ lock.releaseLock(); }catch(_){}
+    try{ lock.releaseLock(); }catch(_){ }
   }
 }
 
@@ -186,7 +245,7 @@ function pullCalendarUpdates(){
       toast_('Inbound pull complete (windowed).');
     }
   } finally {
-    try{ lock.releaseLock(); }catch(_){}
+    try{ lock.releaseLock(); }catch(_){ }
   }
 }
 
@@ -415,7 +474,7 @@ function syncRowGrouped_(row, skipColsSet){
       var canDayKey = dateKey_(new Date(canDay.getFullYear(), canDay.getMonth(), canDay.getDate()));
       if (!isCreationSuppressed_(canDayKey, normalizeKey_(titleFromCal), mbrEmailLower)){
         if (!hasGuest_(canEv, mbr.email)) {
-          try { canEv.addGuest(mbr.email); membershipsAdded++; } catch(_){}
+          try { canEv.addGuest(mbr.email); membershipsAdded++; } catch(_){ }
         }
         if (String(mbr.cell.getValue()||'').trim() !== titleFromCal){
           mbr.cell.setValue(titleFromCal);
@@ -647,8 +706,8 @@ function pullCalendarUpdatesWindow_(){
     if (!byDate.hasOwnProperty(dk2)) continue;
     var rowIndex = ensureRowInArrays_(sh, values, notes, dateRowMap, dk2);
     var dayEvents = byDate[dk2];
-    for (var e=0; e<dayEvents.length; e++){
-      var ev2 = dayEvents[e];
+    for (var eIdx=0; eIdx<dayEvents.length; eIdx++){
+      var ev2 = dayEvents[eIdx];
       var title = collapseWhitespace_(ev2.getTitle() || '');
       var titleKey = normalizeKey_(title);
       var guests = ev2.getGuestList() || [];
@@ -684,26 +743,26 @@ function pullCalendarUpdatesWindow_(){
         var okToClear = false;
 
         if (WINDOW_PULL_VERIFY_WITH_GET_BY_ID){
-          var ev = getEventByIdSafe_(calApp, evId);
+          var evObj = getEventByIdSafe_(calApp, evId);
           var rowDayKey = dateKey_(rowDate);
 
-          if (ev){
+          if (evObj){
             // If event exists: clear only if person not guest OR event moved date
-            if (!hasGuest_(ev, emailLower)) okToClear = true;
+            if (!hasGuest_(evObj, emailLower)) okToClear = true;
             else {
-              var st = ev.getStartTime();
-              var evDayKey = dateKey_(new Date(st.getFullYear(), st.getMonth(), st.getDate()));
+              var st2 = evObj.getStartTime();
+              var evDayKey = dateKey_(new Date(st2.getFullYear(), st2.getMonth(), st2.getDate()));
               if (evDayKey !== rowDayKey) okToClear = true;
             }
           } else {
             // Could be deleted… or service hiccup. Be conservative:
             // Look for ANY all-day event on that date that still includes this guest.
-            var dayEvents = getAllDayEventsOn_(calApp, rowDate);
+            var dayEvents2 = getAllDayEventsOn_(calApp, rowDate);
             var guestStillOnSomeEvent = false;
-            for (var ii=0; ii<dayEvents.length; ii++){
-              if (hasGuest_(dayEvents[ii], emailLower)) { guestStillOnSomeEvent = true; break; }
+            for (var ii=0; ii<dayEvents2.length; ii++){
+              if (hasGuest_(dayEvents2[ii], emailLower)) { guestStillOnSomeEvent = true; break; }
             }
-            okToClear = !guestStillOnSomeEvent; // clear only if we *cannot* find them on any event that day
+            okToClear = !guestStillOnSomeEvent; // clear only if we cannot find them on any event that day
           }
         } else {
           // Legacy behavior (not recommended): clear when absent from snapshot
@@ -951,7 +1010,7 @@ function processPendingEdits_(){
            '  C:' + created + ' U:' + updated + ' D:' + deleted +
            ' +G:' + mAdd + ' -G:' + mRem + (errors ? ' Errors:' + errors : ''));
   } finally {
-    try{ lock.releaseLock(); }catch(_){}
+    try{ lock.releaseLock(); }catch(_){ }
   }
 }
 
@@ -1061,9 +1120,9 @@ function forceUnlinkActiveCell(){
       var cal = CalendarApp.getCalendarById(SHARED_CALENDAR_ID);
       var ev  = getEventByIdSafe_(cal, evId);
       if (ev && email && hasGuest_(ev, email)){
-        try { ev.removeGuest(email); } catch(_){}
+        try { ev.removeGuest(email); } catch(_){ }
         if ((ev.getGuestList()||[]).length === 0){
-          try { ev.deleteEvent(); } catch(_){}
+          try { ev.deleteEvent(); } catch(_){ }
         }
       }
     }
@@ -1223,7 +1282,7 @@ function getAllDayEventsOn_(cal, dayStart){
   return out;
 }
 function removeGuestAndDeleteIfEmpty_(ev, email){
-  try { ev.removeGuest(email); } catch(_){}
+  try { ev.removeGuest(email); } catch(_){ }
   var remaining = ev.getGuestList() || [];
   if (remaining.length === 0){
     try { ev.deleteEvent(); return true; } catch(_) {}
