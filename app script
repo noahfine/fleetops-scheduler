@@ -958,6 +958,26 @@ function finalValidationSweep_() {
     var rowDayKey = rowDate ? dateKey_(rowDate) : null;
     for (var c0 = 1; c0 < lastCol; c0++) {
       var note = String(notes[r0][c0] || '').trim();
+      var rawNow = String(values[r0][c0] || '').trim();
+      // If user cleared or typed CANCEL but note still has an eventId, unlink and clear
+      if (note && (!rawNow || equalsIgnoreCase_(rawNow, CANCEL_TOKEN))) {
+        try {
+          var emailLowerDel = String(emailRow[c0] || '').trim().toLowerCase();
+          var evIdDel = parseEventIdFromNote_(note);
+          if (evIdDel) {
+            var evDel = getEventByIdSafe_(cal, evIdDel);
+            if (evDel && emailLowerDel) { removeGuestAndDeleteIfEmpty_(evDel, emailLowerDel); }
+          }
+          // Record suppression to avoid immediate re-create on next outbound pass
+          try {
+            var tKeyDel = parseTitleKeyFromNote_(note);
+            if (rowDayKey && tKeyDel && emailLowerDel) { addSuppression_(rowDayKey, tKeyDel, emailLowerDel, RECREATE_SUPPRESS_HOURS); }
+          } catch(_){ }
+        } catch(_){ }
+        values[r0][c0] = '';
+        notes[r0][c0]  = '';
+        continue;
+      }
       if (!note) continue;
       var evId = parseEventIdFromNote_(note);
       if (!evId) { notes[r0][c0] = ''; continue; }
