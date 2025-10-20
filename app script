@@ -29,6 +29,11 @@ var CANCEL_TOKEN = 'CANCEL';          // typing this removes that person from th
 var DESC_FOOTER_MARK = 'Managed by Schedule Matrix';
 var DESC_FOOTER_PREFIX = '\n\n---\n' + DESC_FOOTER_MARK + ' (Sheets sync)\n';
 
+// Re-creation suppression (prevents deleted events from reappearing too soon)
+var RECREATE_SUPPRESS_HOURS = 24;                // TTL to suppress auto-recreate after deletion/removal
+var RECREATE_SUPPRESS_PROP  = 'RECREATE_SUPPRESS_MAP_JSON';
+var RECREATE_SUPPRESS_MAX   = 5000;              // hard cap to keep storage bounded
+
 // Windowed fallback clear behavior (safe by verification)
 var WINDOW_PULL_VERIFY_WITH_GET_BY_ID = true;         // verify each stale cell via CalendarApp before clearing
 var WINDOW_PULL_CLEAR_GUARD = false;                  // we rely on per-cell verification instead of global counts
@@ -242,6 +247,13 @@ function syncRowGrouped_(row, skipColsSet){
     // Clear / CANCEL
     if (!raw || equalsIgnoreCase_(raw, CANCEL_TOKEN)) {
       if (ev) {
+        // Record suppression for this email/day/title to avoid immediate re-add/create
+        try{
+          var evSt = ev.getStartTime();
+          var evDayKey = dateKey_(new Date(evSt.getFullYear(), evSt.getMonth(), evSt.getDate()));
+          var evTitleNow = collapseWhitespace_(ev.getTitle()||'');
+          addSuppression_(evDayKey, normalizeKey_(evTitleNow), String(email||'').toLowerCase(), RECREATE_SUPPRESS_HOURS);
+        }catch(_){/* best-effort */}
         if (removeGuestAndDeleteIfEmpty_(ev, email)) { deleted++; }
         membershipsRemoved++;
       }
@@ -355,16 +367,24 @@ function syncRowGrouped_(row, skipColsSet){
       }
     }
 
-    // 4) otherwise create
+    // 4) otherwise create (respect per-member suppression)
     if (!chosen){
-      var newDay = targetDay;
-      chosen = cal.createAllDayEvent(groups[k].displayTitle || 'Assignment', newDay, {
-        description: '',
-        guests: '',
-        sendInvites: SEND_INVITES
-      });
-      upsertDescriptionKeepUserContent_(chosen, groups[k].displayTitle);
-      created++;
+      var anyAllowed = false;
+      var targetDayKey = dateKey_(targetDay);
+      for (var supIdx=0; supIdx<mems.length && !anyAllowed; supIdx++){
+        var emailLowerSup = String(mems[supIdx].email || '').toLowerCase();
+        if (!isCreationSuppressed_(targetDayKey, k, emailLowerSup)) anyAllowed = true;
+      }
+      if (anyAllowed){
+        var newDay = targetDay;
+        chosen = cal.createAllDayEvent(groups[k].displayTitle || 'Assignment', newDay, {
+          description: '',
+          guests: '',
+          sendInvites: SEND_INVITES
+        });
+        upsertDescriptionKeepUserContent_(chosen, groups[k].displayTitle);
+        created++;
+      }
     } else {
       upsertDescriptionKeepUserContent_(chosen, groups[k].displayTitle);
       updated++;
@@ -376,6 +396,7 @@ function syncRowGrouped_(row, skipColsSet){
   for (var k2 in groups){
     if (!groups.hasOwnProperty(k2)) continue;
     var canEv = canonicalByKey[k2];
+    if (!canEv) continue; // suppressed group
     var canId = canEv.getId();
     var titleFromCal = collapseWhitespace_(canEv.getTitle()||'');
 
@@ -385,18 +406,22 @@ function syncRowGrouped_(row, skipColsSet){
 
     for (var j=0; j<mems2.length; j++){
       var mbr = mems2[j];
-
       if (mbr.event && canonicalId_(mbr.event.getId()) !== canonicalId_(canId)){
         if (removeGuestAndDeleteIfEmpty_(mbr.event, mbr.email)) { deleted++; }
         membershipsRemoved++;
       }
-      if (!hasGuest_(canEv, mbr.email)) {
-        try { canEv.addGuest(mbr.email); membershipsAdded++; } catch(_){}
+      var mbrEmailLower = String(mbr.email||'').toLowerCase();
+      var canDay = canEv.getStartTime();
+      var canDayKey = dateKey_(new Date(canDay.getFullYear(), canDay.getMonth(), canDay.getDate()));
+      if (!isCreationSuppressed_(canDayKey, normalizeKey_(titleFromCal), mbrEmailLower)){
+        if (!hasGuest_(canEv, mbr.email)) {
+          try { canEv.addGuest(mbr.email); membershipsAdded++; } catch(_){}
+        }
+        if (String(mbr.cell.getValue()||'').trim() !== titleFromCal){
+          mbr.cell.setValue(titleFromCal);
+        }
+        mbr.cell.setNote(JSON.stringify({ eventId: canonicalId_(canId), titleKey: normalizeKey_(titleFromCal), syncedAt: new Date().toISOString() }));
       }
-      if (String(mbr.cell.getValue()||'').trim() !== titleFromCal){
-        mbr.cell.setValue(titleFromCal);
-      }
-      mbr.cell.setNote(JSON.stringify({ eventId: canonicalId_(canId), titleKey: normalizeKey_(titleFromCal), syncedAt: new Date().toISOString() }));
     }
 
     // Remove extra assignee-guests (leave external guests)
@@ -498,6 +523,19 @@ function pullCalendarUpdatesDelta_(){
           values[p.r0][p.c0] = '';
           notes[p.r0][p.c0] = '';
         }
+        // Record suppression to avoid immediate re-creation after deletion
+        try {
+          var dayKeyCancelled = ev.start && ev.start.date ? ev.start.date : null;
+          var titleCancelled = String(ev.summary || '').trim();
+          var titleKeyCancelled = normalizeKey_(titleCancelled);
+          var attendeesCancelled = ev.attendees || [];
+          if (dayKeyCancelled && attendeesCancelled.length){
+            for (var ai=0; ai<attendeesCancelled.length; ai++){
+              var eml = String(attendeesCancelled[ai].email || '').toLowerCase();
+              if (eml) addSuppression_(dayKeyCancelled, titleKeyCancelled, eml, RECREATE_SUPPRESS_HOURS);
+            }
+          }
+        } catch(_){/* best-effort */}
         continue;
       }
 
@@ -673,6 +711,12 @@ function pullCalendarUpdatesWindow_(){
         }
 
         if (okToClear){
+          // Record suppression to avoid immediate re-create on next outbound pass
+          try{
+            var rowDayKey2 = dateKey_(rowDate);
+            var tKeyFromNote = parseTitleKeyFromNote_(notes[r0][c0]);
+            if (tKeyFromNote && emailLower){ addSuppression_(rowDayKey2, tKeyFromNote, emailLower, RECREATE_SUPPRESS_HOURS); }
+          }catch(_){/* best-effort */}
           values[r0][c0] = '';
           notes[r0][c0]  = '';
         }
@@ -1145,6 +1189,15 @@ function parseEventIdFromNote_(note){
     return canonicalId_(String(note || '').trim());
   }
 }
+function parseTitleKeyFromNote_(note){
+  try {
+    var obj = JSON.parse(String(note || ''));
+    var t = obj && obj.titleKey ? obj.titleKey : '';
+    return normalizeKey_(t);
+  } catch(_){
+    return '';
+  }
+}
 function getEventByIdSafe_(cal, id){
   if (!id) return null;
   try { var ev = cal.getEventById(id); if (ev) return ev; } catch(e){}
@@ -1301,4 +1354,63 @@ function daysSince_(iso){
   if (!iso) return 1e9;
   var then = new Date(iso).getTime();
   return (Date.now() - then) / 86400000;
+}
+
+// ===== Re-creation suppression helpers =====
+function suppressionKey_(dayKey, titleKey, emailLower){
+  return [String(dayKey||'').trim(), String(titleKey||'').trim(), String((emailLower||'').toLowerCase().trim())].join('|');
+}
+function loadSuppression_(){
+  try{
+    var raw = PropertiesService.getScriptProperties().getProperty(RECREATE_SUPPRESS_PROP) || '{}';
+    var obj = JSON.parse(raw);
+    return obj && typeof obj === 'object' ? obj : {};
+  }catch(_){ return {}; }
+}
+function saveSuppression_(obj){
+  var now = Date.now();
+  var filtered = {};
+  var items = [];
+  for (var k in obj){
+    if (!obj.hasOwnProperty(k)) continue;
+    var rec = obj[k] || {};
+    var exp = Number(rec.exp)||0;
+    if (exp > now){ filtered[k] = { exp: exp }; items.push({ k: k, exp: exp }); }
+  }
+  if (items.length > RECREATE_SUPPRESS_MAX){
+    items.sort(function(a,b){ return a.exp - b.exp; });
+    var drop = items.length - RECREATE_SUPPRESS_MAX;
+    for (var i=0; i<drop; i++){
+      delete filtered[items[i].k];
+    }
+  }
+  PropertiesService.getScriptProperties().setProperty(RECREATE_SUPPRESS_PROP, JSON.stringify(filtered));
+}
+function addSuppression_(dayKey, titleKey, emailLower, hours){
+  var dk = String(dayKey||'').trim();
+  var tk = normalizeKey_(titleKey||'');
+  var el = String(emailLower||'').toLowerCase().trim();
+  if (!dk || !tk || !el) return;
+  var map = loadSuppression_();
+  var ttlHrs = Math.max(1, Number(hours||RECREATE_SUPPRESS_HOURS));
+  map[suppressionKey_(dk, tk, el)] = { exp: Date.now() + ttlHrs*3600000 };
+  saveSuppression_(map);
+}
+function isCreationSuppressed_(dayKey, titleKey, emailLower){
+  var dk = String(dayKey||'').trim();
+  var tk = normalizeKey_(titleKey||'');
+  var el = String(emailLower||'').toLowerCase().trim();
+  if (!dk || !tk || !el) return false;
+  var map = loadSuppression_();
+  var key = suppressionKey_(dk, tk, el);
+  var rec = map[key];
+  if (!rec) return false;
+  var now = Date.now();
+  var exp = Number(rec.exp)||0;
+  if (exp <= now){
+    delete map[key];
+    saveSuppression_(map);
+    return false;
+  }
+  return true;
 }
