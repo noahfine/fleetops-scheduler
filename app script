@@ -167,7 +167,14 @@ function onEditHandler(e){
                     if (candDel && hasGuest_(candDel, email)) { removeGuestAndDeleteIfEmpty_(candDel, email); }
                   }
                 } catch(_){ }
+                // As a last resort, attempt to remove the guest from any managed event on this date matching the title key
+                try {
+                  var tkDel2 = parseTitleKeyFromNote_(note);
+                  if (tkDel2) { removeGuestFromManagedEventsByTitleKeyOnDay_(cal, dayStart, email, tkDel2); }
+                } catch(_){ }
               }
+              // If user typed the CANCEL token, clear the visible value as well
+              try { if (equalsIgnoreCase_(rawValue, CANCEL_TOKEN)) { cell.setValue(''); } } catch(_){ }
               if (note) cell.setNote('');
               // Prevent inbound pull from overriding this clear immediately
               addSticky_(dayKeyNow, email, CHANGE_STICKY_MINUTES);
@@ -178,11 +185,19 @@ function onEditHandler(e){
             var title = collapseWhitespace_(rawValue);
             var tKey = normalizeKey_(title);
             if (tKey) {
-              // If user changed the title and an old linked event still exists, migrate membership instead of
-              // snapping the sheet back to the calendar title when CALENDAR_WINS_TITLE_DATE is true.
+              // If user changed the title OR the stored event is on a different date,
+              // migrate membership to the correct same-day event instead of reusing the old ID.
               var evTitleFast = existingEvent ? collapseWhitespace_(existingEvent.getTitle() || '') : '';
               var evKeyFast   = normalizeKey_(evTitleFast);
-              if (existingEvent && tKey !== evKeyFast) {
+              var needsMoveOrRelink = false;
+              if (existingEvent) {
+                try {
+                  var stExisting = existingEvent.getStartTime();
+                  var evDayKeyFast = dateKey_(new Date(stExisting.getFullYear(), stExisting.getMonth(), stExisting.getDate()));
+                  needsMoveOrRelink = (tKey !== evKeyFast) || (evDayKeyFast !== dayKeyNow);
+                } catch(_){ needsMoveOrRelink = (tKey !== evKeyFast); }
+              }
+              if (needsMoveOrRelink) {
                 // Find or create the target event by the new title
                 var migrateTarget = findEventOnDayByTitle_(cal, dayStart, tKey);
                 if (!migrateTarget) {
@@ -202,7 +217,7 @@ function onEditHandler(e){
                   addSuppression_(dkOld, evKeyFast, email, RECREATE_SUPPRESS_HOURS);
                 } catch(_) {}
                 removeGuestAndDeleteIfEmpty_(existingEvent, email);
-              toast_('Moved assignment to "' + newEvTitleNow + '" for ' + email);
+                toast_('Moved assignment to "' + newEvTitleNow + '" for ' + email);
                 return;
               }
 
@@ -1537,6 +1552,29 @@ function findEventOnDayByTitle_(cal, dayStart, titleKey){
     }catch(e){}
   }
   return null;
+}
+function removeGuestFromManagedEventsByTitleKeyOnDay_(cal, dayStart, email, titleKey){
+  try{
+    var dayEnd = new Date(dayStart.getFullYear(), dayStart.getMonth(), dayStart.getDate()+1);
+    var evs = cal.getEvents(dayStart, dayEnd);
+    var removedAny = false;
+    for (var i=0; i<evs.length; i++){
+      try{
+        var ev = evs[i];
+        if (!(ev.isAllDayEvent && ev.isAllDayEvent())) continue;
+        var tKey = normalizeKey_(collapseWhitespace_(ev.getTitle()||''));
+        if (tKey !== normalizeKey_(titleKey||'')) continue;
+        var desc = String(ev.getDescription()||'');
+        if (DESC_FOOTER_MARK && desc.indexOf(DESC_FOOTER_MARK) === -1) continue;
+        if (hasGuest_(ev, email)) {
+          try { ev.removeGuest(email); removedAny = true; } catch(_){ }
+          var gl = ev.getGuestList() || [];
+          if (gl.length === 0) { try { ev.deleteEvent(); } catch(_){ } }
+        }
+      }catch(_){ }
+    }
+    return removedAny;
+  }catch(_){ return false; }
 }
 function eventAppearsInOtherGroups_(ev, groups, currentKey){
   if (!ev) return false;
