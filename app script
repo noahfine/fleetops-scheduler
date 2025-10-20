@@ -171,6 +171,7 @@ function onEditHandler(e){
               if (note) cell.setNote('');
               // Prevent inbound pull from overriding this clear immediately
               addSticky_(dayKeyNow, email, CHANGE_STICKY_MINUTES);
+              toast_('Cleared assignment for ' + email + ' on ' + dayKeyNow);
               return;
             }
 
@@ -201,6 +202,7 @@ function onEditHandler(e){
                   addSuppression_(dkOld, evKeyFast, email, RECREATE_SUPPRESS_HOURS);
                 } catch(_) {}
                 removeGuestAndDeleteIfEmpty_(existingEvent, email);
+              toast_('Moved assignment to "' + newEvTitleNow + '" for ' + email);
                 return;
               }
 
@@ -218,6 +220,7 @@ function onEditHandler(e){
               cell.setNote(JSON.stringify({ eventId: canonicalId_(targetEvent.getId()), titleKey: normalizeKey_(evTitleNow), syncedAt: new Date().toISOString() }));
               // Hold cell stable briefly so inbound won't revert
               addSticky_(dayKeyNow, email, CHANGE_STICKY_MINUTES);
+              toast_('Saved assignment "' + evTitleNow + '" for ' + email);
               return;
             }
           }
@@ -426,6 +429,12 @@ function syncRowGrouped_(row, skipColsSet){
                 if (removeGuestAndDeleteIfEmpty_(cand, email)) { deleted++; }
                 membershipsRemoved++;
               }
+            } else {
+              // No concrete event found by ID or title; still record suppression using the titleKey from note
+              try {
+                var fallbackTitleKey = parseTitleKeyFromNote_(note);
+                if (fallbackTitleKey) { addSuppression_(rowDayKey, fallbackTitleKey, String(email||'').toLowerCase(), RECREATE_SUPPRESS_HOURS); }
+              } catch(_){}
             }
           }
         } catch(_){ }
@@ -491,8 +500,14 @@ function syncRowGrouped_(row, skipColsSet){
     }
 
     if (!key) { 
-      // If there was a stale note but no usable title, clear it to prevent blockers
-      if (note) { try { cell.setNote(''); } catch(_){ } }
+      // If there was a stale note but no usable title, clear it and record suppression
+      if (note) { 
+        try {
+          var tkEmpty = parseTitleKeyFromNote_(note);
+          if (tkEmpty) addSuppression_(rowDayKey, tkEmpty, String(email||'').toLowerCase(), RECREATE_SUPPRESS_HOURS);
+        } catch(_){ }
+        try { cell.setNote(''); } catch(_){ }
+      }
       continue; 
     }
     if (!groups[key]) groups[key] = { key: key, displayTitle: displayTitle, members: [], cells: [] };
@@ -578,7 +593,10 @@ function syncRowGrouped_(row, skipColsSet){
       var mbrEmailLower = String(mbr.email||'').toLowerCase();
       var canDay = canEv.getStartTime();
       var canDayKey = dateKey_(new Date(canDay.getFullYear(), canDay.getMonth(), canDay.getDate()));
-      if (!isCreationSuppressed_(canDayKey, normalizeKey_(titleFromCal), mbrEmailLower)){
+      // If this column was part of the current edit, bypass suppression so user intent wins
+      var colIdxSafe = (mbr.cell && mbr.cell.getColumn) ? mbr.cell.getColumn() : null;
+      var isEditedCellNow = !!(skipColsSet && colIdxSafe && skipColsSet[colIdxSafe]);
+      if (isEditedCellNow || !isCreationSuppressed_(canDayKey, normalizeKey_(titleFromCal), mbrEmailLower)){
         if (!hasGuest_(canEv, mbr.email)) {
           try { canEv.addGuest(mbr.email); membershipsAdded++; } catch(_){ }
         }
@@ -1123,7 +1141,8 @@ function processPendingEdits_(){
     var created=0, updated=0, deleted=0, mAdd=0, mRem=0, skipped=0, errors=0;
 
     var lastCol = sh.getLastColumn();
-    var skipColsSet = {}; for (var c = 2; c <= lastCol; c++) skipColsSet[c] = true;
+    // Do not treat queued rows as "edited columns"; honor suppression rules during retries
+    var skipColsSet = undefined;
 
     for (var i=0;i<rows.length;i++){
       var r = rows[i];
