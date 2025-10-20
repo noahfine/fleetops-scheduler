@@ -275,6 +275,8 @@ function onEditHandler(e){
     toast_('Edit sync: rows ' + start + '–' + r2 +
            '  C:' + created + ' U:' + updated + ' D:' + deleted +
            ' +G:' + mAdd + ' -G:' + mRem + (errors ? ' Errors:' + errors : ''));
+    // Final validation to clear any orphaned IDs if multiple quick edits occurred
+    try { finalValidationSweep_(); } catch(_){ }
   }catch(err){
     if (sh && r1 && r2) { queueRowsForSync_(sh.getName(), r1, r2); scheduleOneOff_('processPendingEdits_', 0.05); }
     toast_('onEditHandler error (queued for retry): ' + err);
@@ -347,6 +349,8 @@ function syncSelectedRow() {
   if (r < DATA_START_ROW) return toast_('Select a data row (row >= ' + DATA_START_ROW + ').');
   var res = syncRowGrouped_(r);
   toast_(res.summary);
+  // Safety: clear any orphaned IDs that might remain
+  try { finalValidationSweep_(); } catch(_){ }
 }
 function syncAllRows() {
   var sh = getSheet_();
@@ -360,6 +364,8 @@ function syncAllRows() {
     } catch (e) { errors++; }
   }
   toast_('Done. C:' + created + ' U:' + updated + ' D:' + deleted + ' +G:' + membershipsAdded + ' -G:' + membershipsRemoved + ' S:' + skipped + (errors ? ' Errors:' + errors : ''));
+  // Safety: final sweep to unlink any residual IDs
+  try { finalValidationSweep_(); } catch(_){ }
 }
 
 /***** CORE: sheet → calendar (ID-first; preserves description; calendar-wins; sheet can move/rename) *****/
@@ -1180,6 +1186,8 @@ function processPendingEdits_(){
     toast_('Processed queued edits: ' + rows.length +
            '  C:' + created + ' U:' + updated + ' D:' + deleted +
            ' +G:' + mAdd + ' -G:' + mRem + (errors ? ' Errors:' + errors : ''));
+    // Run a final validation sweep to unlink any leftover event IDs in cleared cells
+    try { finalValidationSweep_(); } catch(_){ }
   } finally {
     try{ lock.releaseLock(); }catch(_){ }
   }
