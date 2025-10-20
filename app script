@@ -434,24 +434,7 @@ function syncRowGrouped_(row, skipColsSet){
       if (matches.length) chosen = matches[0];
     }
 
-    // 3) else, rename a member's other event if not shared by other groups
-    if (!chosen){
-      for (var m2=0; m2<mems.length; m2++){
-        if (mems[m2].event) { chosen = mems[m2].event; break; }
-      }
-      if (chosen){
-        if (!eventAppearsInOtherGroups_(chosen, groups, k)) {
-          try {
-            var desiredTitle = groups[k].displayTitle || 'Assignment';
-            if (collapseWhitespace_(chosen.getTitle()||'') !== desiredTitle) {
-              chosen.setTitle(desiredTitle);
-            }
-          } catch(_){}
-        } else {
-          chosen = null;
-        }
-      }
-    }
+    // 3) intentionally skip renaming unrelated events; prefer creating a new canonical event
 
     // 4) otherwise create (respect per-member suppression)
     if (!chosen){
