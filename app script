@@ -34,6 +34,11 @@ var RECREATE_SUPPRESS_HOURS = 24;                // TTL to suppress auto-recreat
 var RECREATE_SUPPRESS_PROP  = 'RECREATE_SUPPRESS_MAP_JSON';
 var RECREATE_SUPPRESS_MAX   = 5000;              // hard cap to keep storage bounded
 
+// Local change stickiness (blocks inbound overwrites for recent sheet edits)
+var CHANGE_STICKY_MINUTES = 10;                  // how long a sheet edit "wins" over inbound
+var STICKY_SUPPRESS_PROP  = 'STICKY_SUPPRESS_MAP_JSON';
+var STICKY_SUPPRESS_MAX   = 5000;                // cap entries to bound storage
+
 // Windowed fallback clear behavior (safe by verification)
 var WINDOW_PULL_VERIFY_WITH_GET_BY_ID = true;         // verify each stale cell via CalendarApp before clearing
 var WINDOW_PULL_CLEAR_GUARD = false;                  // we rely on per-cell verification instead of global counts
@@ -118,6 +123,7 @@ function onEditHandler(e){
           var email = String(getEmailForCol_(sh, c1) || '').trim().toLowerCase();
           if (dateVal && email) {
             var dayStart = new Date(dateVal.getFullYear(), dateVal.getMonth(), dateVal.getDate());
+            var dayKeyNow = dateKey_(dayStart);
             var rawValue = (e && Object.prototype.hasOwnProperty.call(e, 'value')) ? String(e.value || '').trim() : String(cell.getValue() || '').trim();
             var note = String(cell.getNote() || '').trim();
             var eventId = parseEventIdFromNote_(note);
@@ -134,6 +140,8 @@ function onEditHandler(e){
                 removeGuestAndDeleteIfEmpty_(existingEvent, email);
               }
               if (note) cell.setNote('');
+              // Prevent inbound pull from overriding this clear immediately
+              addSticky_(dayKeyNow, email, CHANGE_STICKY_MINUTES);
               return;
             }
 
@@ -155,6 +163,8 @@ function onEditHandler(e){
                 var newEvTitleNow = collapseWhitespace_(migrateTarget.getTitle() || '');
                 if (String(cell.getValue() || '').trim() !== newEvTitleNow) { cell.setValue(newEvTitleNow); }
                 cell.setNote(JSON.stringify({ eventId: canonicalId_(migrateTarget.getId()), titleKey: normalizeKey_(newEvTitleNow), syncedAt: new Date().toISOString() }));
+                // Hold cell stable briefly so inbound won't revert
+                addSticky_(dayKeyNow, email, CHANGE_STICKY_MINUTES);
                 // Remove from the previous event and suppress re-creation for that old title for this guest
                 try {
                   var stOld = existingEvent.getStartTime();
@@ -177,6 +187,8 @@ function onEditHandler(e){
               }
               if (String(cell.getValue() || '').trim() !== evTitleNow) { cell.setValue(evTitleNow); }
               cell.setNote(JSON.stringify({ eventId: canonicalId_(targetEvent.getId()), titleKey: normalizeKey_(evTitleNow), syncedAt: new Date().toISOString() }));
+              // Hold cell stable briefly so inbound won't revert
+              addSticky_(dayKeyNow, email, CHANGE_STICKY_MINUTES);
               return;
             }
           }
@@ -196,6 +208,22 @@ function onEditHandler(e){
     for (var c = c1; c <= c2; c++) skipColsSet[c] = true;
 
     var start = Math.max(DATA_START_ROW, r1);
+
+    // Mark edited cells as sticky to prevent inbound overwrite while outbound settles
+    try {
+      var lastColSticky = sh.getLastColumn();
+      for (var rr = start; rr <= r2; rr++){
+        var dateCellSticky = sh.getRange(rr, 1);
+        var sheetDateSticky = asDate_(dateCellSticky.getValue());
+        if (!sheetDateSticky) continue;
+        var dayKeySticky = dateKey_(new Date(sheetDateSticky.getFullYear(), sheetDateSticky.getMonth(), sheetDateSticky.getDate()));
+        for (var cc = Math.max(2, c1); cc <= Math.min(lastColSticky, c2); cc++){
+          var emSticky = String(getEmailForCol_(sh, cc) || '').trim().toLowerCase();
+          if (!emSticky) continue;
+          addSticky_(dayKeySticky, emSticky, CHANGE_STICKY_MINUTES);
+        }
+      }
+    } catch(_){ }
     var created=0, updated=0, deleted=0, mAdd=0, mRem=0, skipped=0, errors=0;
 
     for (var r = start; r <= r2; r++){
@@ -316,6 +344,7 @@ function syncRowGrouped_(row, skipColsSet){
   var lastCol = sh.getLastColumn();
   var created=0, updated=0, deleted=0, membershipsAdded=0, membershipsRemoved=0, skipped=0;
   var rowDayStart = new Date(sheetDate.getFullYear(), sheetDate.getMonth(), sheetDate.getDate());
+  var rowDayKey   = dateKey_(rowDayStart);
 
   var groups = {};     // key -> { displayTitle, members:[{email,cell,event,eventId}], cells:[] }
   var candidates = []; // for possible row relocation if calendar moved date
@@ -344,6 +373,8 @@ function syncRowGrouped_(row, skipColsSet){
         membershipsRemoved++;
       }
       if (note) cell.setNote('');
+      // Make this cell sticky so inbound won't re-populate it immediately
+      addSticky_(rowDayKey, email.toLowerCase(), CHANGE_STICKY_MINUTES);
       continue;
     }
 
@@ -482,7 +513,8 @@ function syncRowGrouped_(row, skipColsSet){
       var mbrEmailLower = String(mbr.email||'').toLowerCase();
       var canDay = canEv.getStartTime();
       var canDayKey = dateKey_(new Date(canDay.getFullYear(), canDay.getMonth(), canDay.getDate()));
-      if (!isCreationSuppressed_(canDayKey, normalizeKey_(titleFromCal), mbrEmailLower)){
+      // Respect sticky suppression first: if user just edited this cell, don't modify yet
+      if (!isStickySuppressed_(canDayKey, mbrEmailLower) && !isCreationSuppressed_(canDayKey, normalizeKey_(titleFromCal), mbrEmailLower)){
         if (!hasGuest_(canEv, mbr.email)) {
           try { canEv.addGuest(mbr.email); membershipsAdded++; } catch(_){ }
         }
@@ -629,7 +661,9 @@ function pullCalendarUpdatesDelta_(){
 
       for (var emailLower in attendeeSet){
         if (!attendeeSet.hasOwnProperty(emailLower)) continue;
-        // Respect suppression to avoid resurrecting recently-deleted assignments during eventual consistency
+        // Respect sticky suppression first: user's recent sheet edit should not be overridden
+        if (isStickySuppressed_(dayKey, emailLower)) continue;
+        // Respect re-creation suppression to avoid resurrecting recently-deleted assignments during eventual consistency
         if (isCreationSuppressed_(dayKey, titleKey, emailLower)) continue;
         var col = emailColMap[emailLower];
         if (!col) continue;
@@ -726,7 +760,9 @@ function pullCalendarUpdatesWindow_(){
 
       for (var g=0; g<guests.length; g++){
         var em = (guests[g].getEmail() || '').toLowerCase();
-        // Respect suppression to avoid resurrecting recently-deleted assignments during eventual consistency
+        // Respect sticky suppression first: user's recent sheet edit should not be overridden
+        if (isStickySuppressed_(dk2, em)) continue;
+        // Respect re-creation suppression to avoid resurrecting recently-deleted assignments during eventual consistency
         if (isCreationSuppressed_(dk2, titleKey, em)) continue;
         var col = emailColMap[em];
         if (!col) continue;
@@ -849,6 +885,9 @@ function finalValidationSweep_() {
 
       var email = String(emailRow[c0] || '').trim().toLowerCase();
       if (!email) continue;
+
+      // Do not overwrite cells that are currently sticky (recent local edits)
+      if (rowDayKey && isStickySuppressed_(rowDayKey, email)) { continue; }
 
       if (!hasGuest_(ev, email)) { values[r0][c0] = ''; notes[r0][c0] = ''; continue; }
 
@@ -1160,6 +1199,63 @@ function stripFooter_(s){
   return idx >= 0 ? s.substring(0, idx).replace(/\s+$/,'') : s;
 }
 
+// ===== Sticky suppression helpers (short-term inbound hold after local edit) =====
+function stickyKey_(dayKey, emailLower){
+  return [String(dayKey||'').trim(), String((emailLower||'').toLowerCase().trim())].join('|');
+}
+function loadSticky_(){
+  try{
+    var raw = PropertiesService.getScriptProperties().getProperty(STICKY_SUPPRESS_PROP) || '{}';
+    var obj = JSON.parse(raw);
+    return obj && typeof obj === 'object' ? obj : {};
+  }catch(_){ return {}; }
+}
+function saveSticky_(obj){
+  var now = Date.now();
+  var filtered = {};
+  var items = [];
+  for (var k in obj){
+    if (!obj.hasOwnProperty(k)) continue;
+    var rec = obj[k] || {};
+    var exp = Number(rec.exp)||0;
+    if (exp > now){ filtered[k] = { exp: exp }; items.push({ k: k, exp: exp }); }
+  }
+  if (items.length > STICKY_SUPPRESS_MAX){
+    items.sort(function(a,b){ return a.exp - b.exp; });
+    var drop = items.length - STICKY_SUPPRESS_MAX;
+    for (var i=0; i<drop; i++){
+      delete filtered[items[i].k];
+    }
+  }
+  PropertiesService.getScriptProperties().setProperty(STICKY_SUPPRESS_PROP, JSON.stringify(filtered));
+}
+function addSticky_(dayKey, emailLower, minutes){
+  var dk = String(dayKey||'').trim();
+  var el = String(emailLower||'').toLowerCase().trim();
+  if (!dk || !el) return;
+  var map = loadSticky_();
+  var ttlMin = Math.max(1, Number(minutes||CHANGE_STICKY_MINUTES));
+  map[stickyKey_(dk, el)] = { exp: Date.now() + ttlMin*60000 };
+  saveSticky_(map);
+}
+function isStickySuppressed_(dayKey, emailLower){
+  var dk = String(dayKey||'').trim();
+  var el = String(emailLower||'').toLowerCase().trim();
+  if (!dk || !el) return false;
+  var map = loadSticky_();
+  var key = stickyKey_(dk, el);
+  var rec = map[key];
+  if (!rec) return false;
+  var now = Date.now();
+  var exp = Number(rec.exp)||0;
+  if (exp <= now){
+    delete map[key];
+    saveSticky_(map);
+    return false;
+  }
+  return true;
+}
+
 /***** UTILITIES: SHEET BATCH OPS *****/
 function getSheet_(){
   var ss = SpreadsheetApp.getActive();
@@ -1412,6 +1508,11 @@ function pruneDeletedEventRefsForRow_(row, cal, emailsMap, skipColsSet){
       if (isEditedCol) {
         // User just pasted/typed here: drop the stale note but PRESERVE the value
         cell.setNote('');
+        // Also mark sticky to prevent inbound override for a short time
+        try {
+          var rowDate = asDate_(sh.getRange(row,1).getValue());
+          if (rowDate) addSticky_(dateKey_(new Date(rowDate.getFullYear(), rowDate.getMonth(), rowDate.getDate())), email, CHANGE_STICKY_MINUTES);
+        } catch(_){ }
       } else {
         // Clear value+note only when not part of the current edit pass
         cell.setValue('');
