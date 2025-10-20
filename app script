@@ -39,6 +39,9 @@ var CHANGE_STICKY_MINUTES = 10;                  // how long a sheet edit "wins"
 var STICKY_SUPPRESS_PROP  = 'STICKY_SUPPRESS_MAP_JSON';
 var STICKY_SUPPRESS_MAX   = 5000;                // cap entries to bound storage
 
+// Queueing/debounce for outbound edits (all heavy work runs off-thread)
+var EDIT_DEBOUNCE_MINUTES = 0.05; // ~3 seconds; coalesce rapid edits safely
+
 // Windowed fallback clear behavior (safe by verification)
 var WINDOW_PULL_VERIFY_WITH_GET_BY_ID = true;         // verify each stale cell via CalendarApp before clearing
 var WINDOW_PULL_CLEAR_GUARD = false;                  // we rely on per-cell verification instead of global counts
@@ -91,212 +94,43 @@ function disableAutosync() {
   toast_(n ? 'Autosync disabled.' : 'No autosync trigger found.');
 }
 function onEditHandler(e){
-  var lock = LockService.getScriptLock();
-  var sh, r1, r2, c1, c2;
+  // Queue-only architecture: coalesce rapid edits, do not mutate calendar from onEdit
   try{
     if(!e || !e.range) return;
-    sh = e.range.getSheet();
+    var sh = e.range.getSheet();
     if (sh.getName() !== SHEET_NAME) return;
 
-    // Determine bounds without flushing for a fast single-cell path
-    r1 = e.range.getRow();
-    r2 = e.range.getLastRow ? e.range.getLastRow() : r1;
-    c1 = e.range.getColumn();
-    c2 = e.range.getLastColumn ? e.range.getLastColumn() : c1;
+    var r1 = e.range.getRow();
+    var r2 = e.range.getLastRow ? e.range.getLastRow() : r1;
+    var c1 = e.range.getColumn();
+    var c2 = e.range.getLastColumn ? e.range.getLastColumn() : c1;
 
-    // Short lock wait; if busy, queue a near-term retry
-    if(!lock.tryLock(300)) {
-      // Mark edited cells sticky to avoid inbound overwrite while queued
-      try {
-        var lastColSt = sh.getLastColumn();
-        var startRowSt = Math.max(DATA_START_ROW, r1);
-        for (var rrSt = startRowSt; rrSt <= r2; rrSt++){
-          var dateValSt = asDate_(sh.getRange(rrSt,1).getValue());
-          if (!dateValSt) continue;
-          var dayKeySt = dateKey_(new Date(dateValSt.getFullYear(), dateValSt.getMonth(), dateValSt.getDate()));
-          for (var ccSt = Math.max(2, c1); ccSt <= Math.min(lastColSt, c2); ccSt++){
-            var emSt = String(getEmailForCol_(sh, ccSt) || '').trim().toLowerCase();
-            if (!emSt) continue;
-            addSticky_(dayKeySt, emSt, CHANGE_STICKY_MINUTES);
-          }
-        }
-      } catch(_){ }
-      queueRowsForSync_(sh.getName(), r1, r2);
-      scheduleOneOff_('processPendingEdits_', 0.05); // ~3 seconds
-      return;
-    }
-
-    // Fast path for single-cell edits inside the data grid
-    var isSingleCell = (r1 === r2) && (c1 === c2) && r1 >= DATA_START_ROW && c1 >= 2;
-    if (isSingleCell) {
-      // Try fast single-cell processing; on failure, queue row and exit
-      try {
-        var cal = CalendarApp.getCalendarById(SHARED_CALENDAR_ID);
-        if (cal) {
-          var cell = sh.getRange(r1, c1);
-          var dateVal = asDate_(sh.getRange(r1,1).getValue());
-          var email = String(getEmailForCol_(sh, c1) || '').trim().toLowerCase();
-          if (dateVal && email) {
-            var dayStart = new Date(dateVal.getFullYear(), dateVal.getMonth(), dateVal.getDate());
-            var dayKeyNow = dateKey_(dayStart);
-            var rawValue = (e && Object.prototype.hasOwnProperty.call(e, 'value')) ? String(e.value || '').trim() : String(cell.getValue() || '').trim();
-            var note = String(cell.getNote() || '').trim();
-            var eventId = parseEventIdFromNote_(note);
-            var existingEvent = eventId ? getEventByIdSafe_(cal, eventId) : null;
-
-            if (!rawValue || equalsIgnoreCase_(rawValue, CANCEL_TOKEN)) {
-              if (existingEvent) {
-                try {
-                  var st = existingEvent.getStartTime();
-                  var dk = dateKey_(new Date(st.getFullYear(), st.getMonth(), st.getDate()));
-                  var tNow = collapseWhitespace_(existingEvent.getTitle() || '');
-                  addSuppression_(dk, normalizeKey_(tNow), email, RECREATE_SUPPRESS_HOURS);
-                } catch(_) {}
-                removeGuestAndDeleteIfEmpty_(existingEvent, email);
-              } else if (note) {
-                // Fallback: try to locate by title key when ID lookup fails (event moved/ID variance)
-                try {
-                  var tkDel = parseTitleKeyFromNote_(note);
-                  if (tkDel) {
-                    var candDel = findEventOnDayByTitle_(cal, dayStart, tkDel);
-                    if (!candDel) {
-                      var prevDel = new Date(dayStart.getFullYear(), dayStart.getMonth(), dayStart.getDate()-1);
-                      var nextDel = new Date(dayStart.getFullYear(), dayStart.getMonth(), dayStart.getDate()+1);
-                      candDel = findEventOnDayByTitle_(cal, prevDel, tkDel) || findEventOnDayByTitle_(cal, nextDel, tkDel);
-                    }
-                    if (candDel && hasGuest_(candDel, email)) { removeGuestAndDeleteIfEmpty_(candDel, email); }
-                  }
-                } catch(_){ }
-                // As a last resort, attempt to remove the guest from any managed event on this date matching the title key
-                try {
-                  var tkDel2 = parseTitleKeyFromNote_(note);
-                  if (tkDel2) { removeGuestFromManagedEventsByTitleKeyOnDay_(cal, dayStart, email, tkDel2); }
-                } catch(_){ }
-              }
-              // If user typed the CANCEL token, clear the visible value as well
-              try { if (equalsIgnoreCase_(rawValue, CANCEL_TOKEN)) { cell.setValue(''); } } catch(_){ }
-              if (note) cell.setNote('');
-              // Prevent inbound pull from overriding this clear immediately
-              addSticky_(dayKeyNow, email, CHANGE_STICKY_MINUTES);
-              toast_('Cleared assignment for ' + email + ' on ' + dayKeyNow);
-              return;
-            }
-
-            var title = collapseWhitespace_(rawValue);
-            var tKey = normalizeKey_(title);
-            if (tKey) {
-              // If user changed the title OR the stored event is on a different date,
-              // migrate membership to the correct same-day event instead of reusing the old ID.
-              var evTitleFast = existingEvent ? collapseWhitespace_(existingEvent.getTitle() || '') : '';
-              var evKeyFast   = normalizeKey_(evTitleFast);
-              var needsMoveOrRelink = false;
-              if (existingEvent) {
-                try {
-                  var stExisting = existingEvent.getStartTime();
-                  var evDayKeyFast = dateKey_(new Date(stExisting.getFullYear(), stExisting.getMonth(), stExisting.getDate()));
-                  needsMoveOrRelink = (tKey !== evKeyFast) || (evDayKeyFast !== dayKeyNow);
-                } catch(_){ needsMoveOrRelink = (tKey !== evKeyFast); }
-              }
-              if (needsMoveOrRelink) {
-                // Find or create the target event by the new title
-                var migrateTarget = findEventOnDayByTitle_(cal, dayStart, tKey);
-                if (!migrateTarget) {
-                  migrateTarget = cal.createAllDayEvent(title, dayStart, { description: '', guests: '', sendInvites: SEND_INVITES });
-                }
-                upsertDescriptionKeepUserContent_(migrateTarget, title);
-                if (!hasGuest_(migrateTarget, email)) { try { migrateTarget.addGuest(email); } catch(_) {} }
-                var newEvTitleNow = collapseWhitespace_(migrateTarget.getTitle() || '');
-                if (String(cell.getValue() || '').trim() !== newEvTitleNow) { cell.setValue(newEvTitleNow); }
-                cell.setNote(JSON.stringify({ eventId: canonicalId_(migrateTarget.getId()), titleKey: normalizeKey_(newEvTitleNow), syncedAt: new Date().toISOString() }));
-                // Hold cell stable briefly so inbound won't revert
-                addSticky_(dayKeyNow, email, CHANGE_STICKY_MINUTES);
-                // Remove from the previous event and suppress re-creation for that old title for this guest
-                try {
-                  var stOld = existingEvent.getStartTime();
-                  var dkOld = dateKey_(new Date(stOld.getFullYear(), stOld.getMonth(), stOld.getDate()));
-                  addSuppression_(dkOld, evKeyFast, email, RECREATE_SUPPRESS_HOURS);
-                } catch(_) {}
-                removeGuestAndDeleteIfEmpty_(existingEvent, email);
-                toast_('Moved assignment to "' + newEvTitleNow + '" for ' + email);
-                return;
-              }
-
-              var targetEvent = existingEvent || findEventOnDayByTitle_(cal, dayStart, tKey);
-              if (!targetEvent) {
-                targetEvent = cal.createAllDayEvent(title, dayStart, { description: '', guests: '', sendInvites: SEND_INVITES });
-              }
-              upsertDescriptionKeepUserContent_(targetEvent, title);
-              if (!hasGuest_(targetEvent, email)) { try { targetEvent.addGuest(email); } catch(_) {} }
-              var evTitleNow = collapseWhitespace_(targetEvent.getTitle() || '');
-              if (!CALENDAR_WINS_TITLE_DATE && evTitleNow !== title) {
-                try { targetEvent.setTitle(title); evTitleNow = title; } catch(_) {}
-              }
-              if (String(cell.getValue() || '').trim() !== evTitleNow) { cell.setValue(evTitleNow); }
-              cell.setNote(JSON.stringify({ eventId: canonicalId_(targetEvent.getId()), titleKey: normalizeKey_(evTitleNow), syncedAt: new Date().toISOString() }));
-              // Hold cell stable briefly so inbound won't revert
-              addSticky_(dayKeyNow, email, CHANGE_STICKY_MINUTES);
-              toast_('Saved assignment "' + evTitleNow + '" for ' + email);
-              return;
-            }
-          }
-        }
-      } catch(errFast) {
-        // Mark sticky best-effort to prevent inbound overwrite while queued
-        try {
-          if (dayKeyNow && email) { addSticky_(dayKeyNow, email, CHANGE_STICKY_MINUTES); }
-        } catch(_){ }
-        // Fall through to queue
-      }
-      queueRowsForSync_(sh.getName(), r1, r1);
-      scheduleOneOff_('processPendingEdits_', 0.05);
-      return;
-    }
-
-    // Fallback for multi-cell/paste edits
-    SpreadsheetApp.flush();
-
-    var skipColsSet = {};
-    for (var c = c1; c <= c2; c++) skipColsSet[c] = true;
-
-    var start = Math.max(DATA_START_ROW, r1);
-
-    // Mark edited cells as sticky to prevent inbound overwrite while outbound settles
+    // Mark edited cells sticky to prevent inbound overwrite while queued
     try {
-      var lastColSticky = sh.getLastColumn();
-      for (var rr = start; rr <= r2; rr++){
-        var dateCellSticky = sh.getRange(rr, 1);
-        var sheetDateSticky = asDate_(dateCellSticky.getValue());
-        if (!sheetDateSticky) continue;
-        var dayKeySticky = dateKey_(new Date(sheetDateSticky.getFullYear(), sheetDateSticky.getMonth(), sheetDateSticky.getDate()));
-        for (var cc = Math.max(2, c1); cc <= Math.min(lastColSticky, c2); cc++){
-          var emSticky = String(getEmailForCol_(sh, cc) || '').trim().toLowerCase();
-          if (!emSticky) continue;
-          addSticky_(dayKeySticky, emSticky, CHANGE_STICKY_MINUTES);
+      var lastColSt = sh.getLastColumn();
+      var startRowSt = Math.max(DATA_START_ROW, r1);
+      for (var rrSt = startRowSt; rrSt <= r2; rrSt++){
+        var dateValSt = asDate_(sh.getRange(rrSt,1).getValue());
+        if (!dateValSt) continue;
+        var dayKeySt = dateKey_(new Date(dateValSt.getFullYear(), dateValSt.getMonth(), dateValSt.getDate()));
+        for (var ccSt = Math.max(2, c1); ccSt <= Math.min(lastColSt, c2); ccSt++){
+          var emSt = String(getEmailForCol_(sh, ccSt) || '').trim().toLowerCase();
+          if (!emSt) continue; // free-text columns are not managed
+          addSticky_(dayKeySt, emSt, CHANGE_STICKY_MINUTES);
         }
       }
     } catch(_){ }
-    var created=0, updated=0, deleted=0, mAdd=0, mRem=0, skipped=0, errors=0;
 
-    for (var r = start; r <= r2; r++){
-      try{
-        var res = syncRowGrouped_(r, skipColsSet);
-        created += res.created; updated += res.updated; deleted += res.deleted;
-        mAdd += res.membershipsAdded; mRem += res.membershipsRemoved; skipped += res.skipped;
-      }catch(err){ errors++; queueRowsForSync_(sh.getName(), r, r); }
-    }
-
-    if (errors) scheduleOneOff_('processPendingEdits_', 0.05);
-
-    toast_('Edit sync: rows ' + start + '–' + r2 +
-           '  C:' + created + ' U:' + updated + ' D:' + deleted +
-           ' +G:' + mAdd + ' -G:' + mRem + (errors ? ' Errors:' + errors : ''));
-    // Final validation to clear any orphaned IDs if multiple quick edits occurred
-    try { finalValidationSweep_(); } catch(_){ }
+    // Persist which columns in each row were edited; used to bypass suppression only for those cells
+    recordEditedColsForRows_(sh.getName(), r1, r2, c1, c2);
+    // Also queue rows for processing
+    queueRowsForSync_(sh.getName(), r1, r2);
+    // Debounced outbound processing
+    scheduleOneOff_('processPendingEdits_', EDIT_DEBOUNCE_MINUTES);
   }catch(err){
-    if (sh && r1 && r2) { queueRowsForSync_(sh.getName(), r1, r2); scheduleOneOff_('processPendingEdits_', 0.05); }
-    toast_('onEditHandler error (queued for retry): ' + err);
-  }finally{
-    try{ lock.releaseLock(); }catch(_){ }
+    // On any failure, still ensure rows get queued for a later attempt
+    try{ var sh2 = SpreadsheetApp.getActiveSheet(); if (sh2) queueRowsForSync_(sh2.getName(), e.range.getRow(), e.range.getLastRow ? e.range.getLastRow() : e.range.getRow()); }catch(_){ }
+    toast_('onEdit queued (will retry shortly).');
   }
 }
 
@@ -1165,12 +999,15 @@ function scheduleOneOff_(handler, minutes){
 function processPendingEdits_(){
   var lock = LockService.getScriptLock();
   try{
-    if(!lock.tryLock(5000)) return;
+    if(!lock.tryLock(10000)) return; // allow brief coalescing and reduce contention
 
     var props = PropertiesService.getScriptProperties();
     var raw = props.getProperty('PENDING_ROWS_JSON') || '{}';
     var obj = {};
     try{ obj = JSON.parse(raw) || {}; }catch(_){ obj = {}; }
+
+    // Load per-row edited columns map and project sheet-specific view
+    var editedColsAll = loadEditedCols_();
 
     var sh = getSheet_();
     var name = sh.getName();
@@ -1182,12 +1019,11 @@ function processPendingEdits_(){
     var created=0, updated=0, deleted=0, mAdd=0, mRem=0, skipped=0, errors=0;
 
     var lastCol = sh.getLastColumn();
-    // Do not treat queued rows as "edited columns"; honor suppression rules during retries
-    var skipColsSet = undefined;
 
     for (var i=0;i<rows.length;i++){
       var r = rows[i];
       try{
+        var skipColsSet = projectEditedColsForRow_(editedColsAll, sh.getName(), r);
         var res = syncRowGrouped_(r, skipColsSet);
         created += res.created; updated += res.updated; deleted += res.deleted;
         mAdd += res.membershipsAdded; mRem += res.membershipsRemoved; skipped += res.skipped;
@@ -1197,6 +1033,8 @@ function processPendingEdits_(){
 
     obj[name] = set;
     props.setProperty('PENDING_ROWS_JSON', JSON.stringify(obj));
+    // Clear edited-cols markers for processed rows to prevent lingering bypass
+    clearEditedColsForRows_(sh.getName(), rows);
 
     toast_('Processed queued edits: ' + rows.length +
            '  C:' + created + ' U:' + updated + ' D:' + deleted +
