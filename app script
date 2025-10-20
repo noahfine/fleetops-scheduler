@@ -140,6 +140,31 @@ function onEditHandler(e){
             var title = collapseWhitespace_(rawValue);
             var tKey = normalizeKey_(title);
             if (tKey) {
+              // If user changed the title and an old linked event still exists, migrate membership instead of
+              // snapping the sheet back to the calendar title when CALENDAR_WINS_TITLE_DATE is true.
+              var evTitleFast = existingEvent ? collapseWhitespace_(existingEvent.getTitle() || '') : '';
+              var evKeyFast   = normalizeKey_(evTitleFast);
+              if (existingEvent && tKey !== evKeyFast) {
+                // Find or create the target event by the new title
+                var migrateTarget = findEventOnDayByTitle_(cal, dayStart, tKey);
+                if (!migrateTarget) {
+                  migrateTarget = cal.createAllDayEvent(title, dayStart, { description: '', guests: '', sendInvites: SEND_INVITES });
+                }
+                upsertDescriptionKeepUserContent_(migrateTarget, title);
+                if (!hasGuest_(migrateTarget, email)) { try { migrateTarget.addGuest(email); } catch(_) {} }
+                var newEvTitleNow = collapseWhitespace_(migrateTarget.getTitle() || '');
+                if (String(cell.getValue() || '').trim() !== newEvTitleNow) { cell.setValue(newEvTitleNow); }
+                cell.setNote(JSON.stringify({ eventId: canonicalId_(migrateTarget.getId()), titleKey: normalizeKey_(newEvTitleNow), syncedAt: new Date().toISOString() }));
+                // Remove from the previous event and suppress re-creation for that old title for this guest
+                try {
+                  var stOld = existingEvent.getStartTime();
+                  var dkOld = dateKey_(new Date(stOld.getFullYear(), stOld.getMonth(), stOld.getDate()));
+                  addSuppression_(dkOld, evKeyFast, email, RECREATE_SUPPRESS_HOURS);
+                } catch(_) {}
+                removeGuestAndDeleteIfEmpty_(existingEvent, email);
+                return;
+              }
+
               var targetEvent = existingEvent || findEventOnDayByTitle_(cal, dayStart, tKey);
               if (!targetEvent) {
                 targetEvent = cal.createAllDayEvent(title, dayStart, { description: '', guests: '', sendInvites: SEND_INVITES });
@@ -621,6 +646,8 @@ function pullCalendarUpdatesDelta_(){
 
       for (var emailLower in attendeeSet){
         if (!attendeeSet.hasOwnProperty(emailLower)) continue;
+        // Respect suppression to avoid resurrecting recently-deleted assignments during eventual consistency
+        if (isCreationSuppressed_(dayKey, titleKey, emailLower)) continue;
         var col = emailColMap[emailLower];
         if (!col) continue;
         var c0 = col - 1;
@@ -716,6 +743,8 @@ function pullCalendarUpdatesWindow_(){
 
       for (var g=0; g<guests.length; g++){
         var em = (guests[g].getEmail() || '').toLowerCase();
+        // Respect suppression to avoid resurrecting recently-deleted assignments during eventual consistency
+        if (isCreationSuppressed_(dk2, titleKey, em)) continue;
         var col = emailColMap[em];
         if (!col) continue;
         var c0 = col - 1;
