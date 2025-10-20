@@ -513,8 +513,7 @@ function syncRowGrouped_(row, skipColsSet){
       var mbrEmailLower = String(mbr.email||'').toLowerCase();
       var canDay = canEv.getStartTime();
       var canDayKey = dateKey_(new Date(canDay.getFullYear(), canDay.getMonth(), canDay.getDate()));
-      // Respect sticky suppression first: if user just edited this cell, don't modify yet
-      if (!isStickySuppressed_(canDayKey, mbrEmailLower) && !isCreationSuppressed_(canDayKey, normalizeKey_(titleFromCal), mbrEmailLower)){
+      if (!isCreationSuppressed_(canDayKey, normalizeKey_(titleFromCal), mbrEmailLower)){
         if (!hasGuest_(canEv, mbr.email)) {
           try { canEv.addGuest(mbr.email); membershipsAdded++; } catch(_){ }
         }
