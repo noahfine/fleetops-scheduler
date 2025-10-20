@@ -146,10 +146,12 @@ function onEditHandler(e){
               }
               upsertDescriptionKeepUserContent_(targetEvent, title);
               if (!hasGuest_(targetEvent, email)) { try { targetEvent.addGuest(email); } catch(_) {} }
-              var titleFromCal = CALENDAR_WINS_TITLE_DATE ? collapseWhitespace_(targetEvent.getTitle() || '') : title;
-              if (!CALENDAR_WINS_TITLE_DATE && titleFromCal !== title) { try { targetEvent.setTitle(title); titleFromCal = title; } catch(_) {} }
-              if (String(cell.getValue() || '').trim() !== titleFromCal) { cell.setValue(titleFromCal); }
-              cell.setNote(JSON.stringify({ eventId: canonicalId_(targetEvent.getId()), titleKey: normalizeKey_(titleFromCal), syncedAt: new Date().toISOString() }));
+              var evTitleNow = collapseWhitespace_(targetEvent.getTitle() || '');
+              if (!CALENDAR_WINS_TITLE_DATE && evTitleNow !== title) {
+                try { targetEvent.setTitle(title); evTitleNow = title; } catch(_) {}
+              }
+              if (String(cell.getValue() || '').trim() !== evTitleNow) { cell.setValue(evTitleNow); }
+              cell.setNote(JSON.stringify({ eventId: canonicalId_(targetEvent.getId()), titleKey: normalizeKey_(evTitleNow), syncedAt: new Date().toISOString() }));
               return;
             }
           }
