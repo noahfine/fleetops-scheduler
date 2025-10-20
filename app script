@@ -106,6 +106,21 @@ function onEditHandler(e){
 
     // Short lock wait; if busy, queue a near-term retry
     if(!lock.tryLock(300)) {
+      // Mark edited cells sticky to avoid inbound overwrite while queued
+      try {
+        var lastColSt = sh.getLastColumn();
+        var startRowSt = Math.max(DATA_START_ROW, r1);
+        for (var rrSt = startRowSt; rrSt <= r2; rrSt++){
+          var dateValSt = asDate_(sh.getRange(rrSt,1).getValue());
+          if (!dateValSt) continue;
+          var dayKeySt = dateKey_(new Date(dateValSt.getFullYear(), dateValSt.getMonth(), dateValSt.getDate()));
+          for (var ccSt = Math.max(2, c1); ccSt <= Math.min(lastColSt, c2); ccSt++){
+            var emSt = String(getEmailForCol_(sh, ccSt) || '').trim().toLowerCase();
+            if (!emSt) continue;
+            addSticky_(dayKeySt, emSt, CHANGE_STICKY_MINUTES);
+          }
+        }
+      } catch(_){ }
       queueRowsForSync_(sh.getName(), r1, r2);
       scheduleOneOff_('processPendingEdits_', 0.05); // ~3 seconds
       return;
@@ -138,6 +153,20 @@ function onEditHandler(e){
                   addSuppression_(dk, normalizeKey_(tNow), email, RECREATE_SUPPRESS_HOURS);
                 } catch(_) {}
                 removeGuestAndDeleteIfEmpty_(existingEvent, email);
+              } else if (note) {
+                // Fallback: try to locate by title key when ID lookup fails (event moved/ID variance)
+                try {
+                  var tkDel = parseTitleKeyFromNote_(note);
+                  if (tkDel) {
+                    var candDel = findEventOnDayByTitle_(cal, dayStart, tkDel);
+                    if (!candDel) {
+                      var prevDel = new Date(dayStart.getFullYear(), dayStart.getMonth(), dayStart.getDate()-1);
+                      var nextDel = new Date(dayStart.getFullYear(), dayStart.getMonth(), dayStart.getDate()+1);
+                      candDel = findEventOnDayByTitle_(cal, prevDel, tkDel) || findEventOnDayByTitle_(cal, nextDel, tkDel);
+                    }
+                    if (candDel && hasGuest_(candDel, email)) { removeGuestAndDeleteIfEmpty_(candDel, email); }
+                  }
+                } catch(_){ }
               }
               if (note) cell.setNote('');
               // Prevent inbound pull from overriding this clear immediately
@@ -194,6 +223,10 @@ function onEditHandler(e){
           }
         }
       } catch(errFast) {
+        // Mark sticky best-effort to prevent inbound overwrite while queued
+        try {
+          if (dayKeyNow && email) { addSticky_(dayKeyNow, email, CHANGE_STICKY_MINUTES); }
+        } catch(_){ }
         // Fall through to queue
       }
       queueRowsForSync_(sh.getName(), r1, r1);
@@ -371,6 +404,31 @@ function syncRowGrouped_(row, skipColsSet){
         }catch(_){/* best-effort */}
         if (removeGuestAndDeleteIfEmpty_(ev, email)) { deleted++; }
         membershipsRemoved++;
+      } else if (note) {
+        // Fallback: locate event by title key if ID lookup failed (moved/ID variance)
+        try {
+          var tKeyDel = parseTitleKeyFromNote_(note);
+          if (tKeyDel) {
+            var cand = findEventOnDayByTitle_(cal, rowDayStart, tKeyDel);
+            if (!cand) {
+              var prev = new Date(rowDayStart.getFullYear(), rowDayStart.getMonth(), rowDayStart.getDate()-1);
+              var next = new Date(rowDayStart.getFullYear(), rowDayStart.getMonth(), rowDayStart.getDate()+1);
+              cand = findEventOnDayByTitle_(cal, prev, tKeyDel) || findEventOnDayByTitle_(cal, next, tKeyDel);
+            }
+            if (cand) {
+              try{
+                var cSt = cand.getStartTime();
+                var cDk = dateKey_(new Date(cSt.getFullYear(), cSt.getMonth(), cSt.getDate()));
+                var cTitle = collapseWhitespace_(cand.getTitle()||'');
+                addSuppression_(cDk, normalizeKey_(cTitle), String(email||'').toLowerCase(), RECREATE_SUPPRESS_HOURS);
+              }catch(_){ }
+              if (hasGuest_(cand, email)) {
+                if (removeGuestAndDeleteIfEmpty_(cand, email)) { deleted++; }
+                membershipsRemoved++;
+              }
+            }
+          }
+        } catch(_){ }
       }
       if (note) cell.setNote('');
       // Make this cell sticky so inbound won't re-populate it immediately
@@ -432,7 +490,11 @@ function syncRowGrouped_(row, skipColsSet){
       dayStartForThis = rowDayStart;
     }
 
-    if (!key) continue;
+    if (!key) { 
+      // If there was a stale note but no usable title, clear it to prevent blockers
+      if (note) { try { cell.setNote(''); } catch(_){ } }
+      continue; 
+    }
     if (!groups[key]) groups[key] = { key: key, displayTitle: displayTitle, members: [], cells: [] };
     groups[key].members.push({ email: email, cell: cell, event: ev, eventId: eventId, key: key, displayTitle: displayTitle, wantDay: dayStartForThis });
     groups[key].cells.push(cell);
@@ -473,7 +535,10 @@ function syncRowGrouped_(row, skipColsSet){
       var targetDayKey = dateKey_(targetDay);
       for (var supIdx=0; supIdx<mems.length && !anyAllowed; supIdx++){
         var emailLowerSup = String(mems[supIdx].email || '').toLowerCase();
-        if (!isCreationSuppressed_(targetDayKey, k, emailLowerSup)) anyAllowed = true;
+        // If this column was part of the current edit, bypass suppression (user intent wins)
+        var colSup = mems[supIdx].cell && mems[supIdx].cell.getColumn ? mems[supIdx].cell.getColumn() : null;
+        var isEdited = !!(skipColsSet && colSup && skipColsSet[colSup]);
+        if (isEdited || !isCreationSuppressed_(targetDayKey, k, emailLowerSup)) anyAllowed = true;
       }
       if (anyAllowed){
         var newDay = targetDay;
@@ -880,7 +945,22 @@ function finalValidationSweep_() {
       if (!evId) { notes[r0][c0] = ''; continue; }
 
       var ev = getEventByIdSafe_(cal, evId);
-      if (!ev) { /* don't clear here; leave for pull/cleanup */ continue; }
+      if (!ev) {
+        // Try a safer fallback: if no event by ID, clear the note if user has no all-day
+        // assignment on this date anymore, to avoid stale IDs preventing saves.
+        try {
+          var emailForCell = String(emailRow[c0] || '').trim().toLowerCase();
+          if (rowDate && emailForCell) {
+            var dayEvents = getAllDayEventsOn_(cal, rowDate);
+            var stillOnSome = false;
+            for (var ii=0; ii<dayEvents.length; ii++){
+              if (hasGuest_(dayEvents[ii], emailForCell)) { stillOnSome = true; break; }
+            }
+            if (!stillOnSome) { values[r0][c0] = ''; notes[r0][c0] = ''; }
+          }
+        } catch(_){ }
+        continue;
+      }
 
       var email = String(emailRow[c0] || '').trim().toLowerCase();
       if (!email) continue;
@@ -1513,9 +1593,27 @@ function pruneDeletedEventRefsForRow_(row, cal, emailsMap, skipColsSet){
           if (rowDate) addSticky_(dateKey_(new Date(rowDate.getFullYear(), rowDate.getMonth(), rowDate.getDate())), email, CHANGE_STICKY_MINUTES);
         } catch(_){ }
       } else {
-        // Clear value+note only when not part of the current edit pass
-        cell.setValue('');
-        cell.setNote('');
+        // Prefer conservative clear: if value is empty, always clear note. If value present,
+        // try one more fallback search by title key before clearing value to avoid user loss.
+        var cellValNow = String(cell.getValue() || '').trim();
+        if (!cellValNow) {
+          cell.setNote('');
+          cell.setValue('');
+        } else {
+          try {
+            var tkCell = parseTitleKeyFromNote_(note);
+            var rowDate2 = asDate_(sh.getRange(row,1).getValue());
+            var dayStart2 = rowDate2 ? new Date(rowDate2.getFullYear(), rowDate2.getMonth(), rowDate2.getDate()) : null;
+            var cand2 = (dayStart2 && tkCell) ? findEventOnDayByTitle_(cal, dayStart2, tkCell) : null;
+            if (cand2 && hasGuest_(cand2, email)) {
+              // Relink
+              cell.setNote(JSON.stringify({ eventId: canonicalId_(cand2.getId()), titleKey: normalizeKey_(cand2.getTitle()||''), syncedAt: new Date().toISOString() }));
+            } else {
+              // Clear note only, keep user's value; outbound will recreate
+              cell.setNote('');
+            }
+          } catch(_){ cell.setNote(''); }
+        }
       }
     }
   }
